@@ -14,6 +14,8 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
     @Published var disk = Metric()
     @Published var cpu = Metric()
     @Published var battery = Metric()
+    @Published var pinned = Set(UserDefaults.standard.stringArray(forKey: "pinnedClips") ?? [])
+    var closePanel: () -> Void = {}   // set by AppDelegate
     @Published var hovered: String?   // clip under cursor
     @Published var copied: String?    // clip just copied (shows ✓)
 
@@ -162,9 +164,19 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
     private func add(_ clip: String) {
         clips.removeAll { $0 == clip }
         clips.insert(clip, at: 0)
-        for old in clips.dropFirst(30) { remove(file: old) }
-        clips = Array(clips.prefix(30))
+        // The 30-clip cap only counts unpinned clips; pinned ones are never evicted.
+        let keep = Set(clips.filter { !pinned.contains($0) }.prefix(30))
+        for old in clips where !pinned.contains(old) && !keep.contains(old) { remove(file: old) }
+        clips = clips.filter { pinned.contains($0) || keep.contains($0) }
         UserDefaults.standard.set(clips, forKey: "clips")
+    }
+
+    /// Pinned clips first (most recent first), then the rest.
+    var ordered: [String] { clips.filter(pinned.contains) + clips.filter { !pinned.contains($0) } }
+
+    func togglePin(_ clip: String) {
+        if pinned.contains(clip) { pinned.remove(clip) } else { pinned.insert(clip) }
+        UserDefaults.standard.set(Array(pinned), forKey: "pinnedClips")
     }
 
     private func remove(file clip: String) {
@@ -183,16 +195,35 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
         }
     }
 
+    /// Put the clip on the clipboard and type it into whatever you were focused on (sends ⌘V).
+    /// The panel is non-activating, so the previous app is still frontmost. Needs the same
+    /// Accessibility permission as key sounds; without it this falls back to plain copy.
+    func paste(_ clip: String) {
+        copy(clip)
+        guard AXIsProcessTrusted() else { return }
+        closePanel()
+        // Give the panel a beat to hand focus back before the keystroke lands.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            let src = CGEventSource(stateID: .combinedSessionState)
+            for down in [true, false] {
+                let e = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: down)   // 9 = V
+                e?.flags = .maskCommand
+                e?.post(tap: .cgSessionEventTap)
+            }
+        }
+    }
+
     /// What gets handed to the app you drop a clip on.
     func dragItem(_ clip: String) -> NSItemProvider {
         if let url = Self.imageURL(clip) { return NSItemProvider(contentsOf: url) ?? NSItemProvider() }
         return NSItemProvider(object: clip as NSString)
     }
 
+    /// Clears everything except pinned clips.
     func clearClips() {
-        clips.forEach(remove(file:))
-        clips = []
-        UserDefaults.standard.removeObject(forKey: "clips")
+        clips.filter { !pinned.contains($0) }.forEach(remove(file:))
+        clips = clips.filter(pinned.contains)
+        UserDefaults.standard.set(clips, forKey: "clips")
     }
 
 
@@ -487,7 +518,7 @@ struct ClipList: View {
             HStack {
                 Label("CLIPBOARD", systemImage: "doc.on.clipboard")
                 Spacer()
-                if !m.clips.isEmpty { Button("Clear") { withAnimation { m.clearClips() } }.buttonStyle(.plain) }
+                if m.clips.contains(where: { !m.pinned.contains($0) }) { Button("Clear") { withAnimation { m.clearClips() } }.buttonStyle(.plain) }
             }
             .font(.system(size: 9, weight: .semibold)).tracking(0.6).foregroundStyle(dim)
             .padding(.horizontal, 4)
@@ -499,11 +530,13 @@ struct ClipList: View {
             } else {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 2) {
-                        ForEach(m.clips, id: \.self) { c in
-                            ClipRow(text: c, image: m.thumb(c), hover: m.hovered == c, copied: m.copied == c) {
-                                m.copy(c)
+                        ForEach(m.ordered, id: \.self) { c in
+                            ClipRow(text: c, image: m.thumb(c), hover: m.hovered == c, copied: m.copied == c, pinned: m.pinned.contains(c)) {
+                                m.paste(c)
                                 withAnimation { m.copied = c }
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { withAnimation { if m.copied == c { m.copied = nil } } }
+                            } onPin: {
+                                withAnimation { m.togglePin(c) }
                             } onHover: { h in
                                 withAnimation(.easeOut(duration: 0.12)) { if h { m.hovered = c } else if m.hovered == c { m.hovered = nil } }
                             }
@@ -520,10 +553,12 @@ struct ClipList: View {
 }
 
 struct ClipRow: View {
-    let text: String, image: NSImage?, hover: Bool, copied: Bool, action: () -> Void, onHover: (Bool) -> Void
+    let text: String, image: NSImage?, hover: Bool, copied: Bool, pinned: Bool
+    let action: () -> Void, onPin: () -> Void, onHover: (Bool) -> Void
 
     var body: some View {
-        Button(action: action) {
+        HStack(spacing: 4) {
+          Button(action: action) {
             HStack(spacing: 6) {
                 if let image {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
@@ -545,14 +580,26 @@ struct ClipRow: View {
                     .foregroundStyle(copied ? .green : dim)
                     .opacity(hover || copied ? 1 : 0)
             }
-            .font(.system(size: 12))
-            .padding(.vertical, 5).padding(.horizontal, 8)
-            .background(Color.white.opacity(hover ? 0.1 : 0), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+
+          Button(action: onPin) {
+              Image(systemName: pinned ? "pin.fill" : "pin")
+                  .font(.system(size: 9, weight: .bold))
+                  .foregroundStyle(pinned ? AnyShapeStyle(Accent.warn[0]) : AnyShapeStyle(dim))
+                  .frame(width: 18, height: 18)
+                  .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .opacity(hover || pinned ? 1 : 0)
+          .help(pinned ? "Unpin" : "Pin to keep this clip")
         }
-        .buttonStyle(.plain)
+        .font(.system(size: 12))
+        .padding(.vertical, 5).padding(.leading, 8).padding(.trailing, 4)
+        .background(Color.white.opacity(hover ? 0.1 : 0), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .onHover(perform: onHover)
-        .help(image == nil ? text : "Click to copy · drag into any app")
+        .help(image == nil ? text : "Click to paste · drag into any app")
     }
 }
 
@@ -587,6 +634,7 @@ struct ClipRow: View {
         panel.hasShadow = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        model.closePanel = { [weak self] in self?.setOpen(false) }
         layout()
         panel.orderFrontRegardless()
         makeStatusItem()
