@@ -267,7 +267,7 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
         i *= 8 / secs; o *= 8 / secs
         netPeak = max(netPeak, i, o)
         let scale = max(capacity, netPeak)
-        let rate = { (b: Double) in b < 10e6 ? String(format: "%.1f Mbps", b / 1e6) : "\(Int(b / 1e6)) Mbps" }
+        let rate = { (b: Double) in b < 1e6 ? "\(Int(b / 1e3)) kbps" : b < 10e6 ? String(format: "%.1f Mbps", b / 1e6) : "\(Int(b / 1e6)) Mbps" }
         down = Metric(value: rate(i), frac: i / scale)
         up = Metric(value: rate(o), frac: o / scale)
     }
