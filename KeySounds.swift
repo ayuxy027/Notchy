@@ -1,9 +1,6 @@
 import AppKit
 import AVFoundation
 
-/// Mechvibes-compatible keyboard sounds. Packs live in Notchy.app/Contents/Resources/Packs/<id>/config.json
-/// in Mechvibes' own format ("single": one file + [startMs, durationMs] per key, "multi": one file per key),
-/// keyed by Mechvibes' standard (libuiohook) keycodes.
 @MainActor final class KeySounds {
     static let dir = Bundle.main.resourceURL!.appendingPathComponent("Packs")
     private let engine = AVAudioEngine()
@@ -18,7 +15,6 @@ import AVFoundation
 
     var volume: Float = 0.5 { didSet { engine.mainMixerNode.outputVolume = volume } }
 
-    /// nil turns sounds off.
     func use(_ id: String?) {
         sounds = [:]
         players.forEach { $0.stop() }
@@ -41,7 +37,6 @@ import AVFoundation
         }
         guard let format = sounds.values.first?.format else { return }
 
-        // A small pool of voices so fast typing overlaps instead of cutting off.
         engine.stop()
         players.forEach { engine.detach($0) }
         players = (0..<12).map { _ in AVAudioPlayerNode() }
@@ -54,15 +49,13 @@ import AVFoundation
     private func play(_ macKey: UInt16) {
         guard let code = Self.keymap[macKey], let buf = sounds[code], buf.format == players.first?.outputFormat(forBus: 0) else { return }
         lastKey = Date()
-        if !engine.isRunning { try? engine.start() }  // paused while idle, or after sleep
+        if !engine.isRunning { try? engine.start() }
         let p = players[nextPlayer]
         nextPlayer = (nextPlayer + 1) % players.count
         p.scheduleBuffer(buf, at: nil, options: .interrupts)
         p.play()
     }
 
-    // MARK: key events (needs Accessibility permission, like Mechvibes)
-    /// After access is granted again (or was stale), re-create the key monitor so it actually receives keys.
     func relisten() {
         guard !sounds.isEmpty else { return }
         if let monitor { NSEvent.removeMonitor(monitor) }
@@ -73,7 +66,6 @@ import AVFoundation
     private func startListening() {
         guard monitor == nil else { return }
         guard AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) else {
-            // Wait for the user to flip the switch in System Settings, then start.
             trustTimer?.invalidate()
             trustTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
                 MainActor.assumeIsolated {
@@ -84,18 +76,17 @@ import AVFoundation
             }
             return
         }
+        idleTimer?.invalidate()
+        if let configWatch { NotificationCenter.default.removeObserver(configWatch) }
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] e in
             MainActor.assumeIsolated { self?.handle(e) }
         }
-        // A running audio engine counts as "playing audio" and keeps the Mac from idle-sleeping.
-        // Pause it after 20 s without typing; the next key press starts it again.
         idleTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.engine.isRunning, Date().timeIntervalSince(self.lastKey) > 20 else { return }
                 self.engine.pause()
             }
         }
-        // Headphones plugged/unplugged or the output device changed: the engine stops itself. Restart it.
         configWatch = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { try? self?.engine.start() }
         }
@@ -114,18 +105,14 @@ import AVFoundation
     private func handle(_ e: NSEvent) {
         switch e.type {
         case .keyDown:
-            // Holding a key plays once, like Mechvibes. (Don't track key-ups: macOS drops the
-            // key-up for keys pressed with ⌘ held, which used to leave keys silent forever after ⌘C.)
             if !e.isARepeat { play(e.keyCode) }
         case .flagsChanged:
-            // Modifiers only send flagsChanged. Sound on press, i.e. when that key's flag is now set.
-            if e.keyCode == 57 { play(57); return }  // caps lock: flag toggles, click every press
+            if e.keyCode == 57 { play(57); return }
             if let flag = Self.modifierFlag[e.keyCode], e.modifierFlags.contains(flag) { play(e.keyCode) }
         default: break
         }
     }
 
-    // MARK: files
     private static func config(_ id: String) -> [String: Any]? {
         guard let d = try? Data(contentsOf: dir.appendingPathComponent("\(id)/config.json")) else { return nil }
         return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
@@ -151,7 +138,6 @@ import AVFoundation
         56: .shift, 60: .shift, 59: .control, 62: .control, 58: .option, 61: .option, 55: .command, 54: .command, 63: .function,
     ]
 
-    /// macOS virtual keycode → Mechvibes/libuiohook keycode.
     static let keymap: [UInt16: Int] = [
         53: 1, 18: 2, 19: 3, 20: 4, 21: 5, 23: 6, 22: 7, 26: 8, 28: 9, 25: 10, 29: 11, 27: 12, 24: 13, 51: 14,
         48: 15, 12: 16, 13: 17, 14: 18, 15: 19, 17: 20, 16: 21, 32: 22, 34: 23, 31: 24, 35: 25, 33: 26, 30: 27, 36: 28,
@@ -162,6 +148,6 @@ import AVFoundation
         62: 3613, 61: 3640, 55: 3675, 54: 3676,
         115: 3655, 116: 3657, 119: 3663, 121: 3665, 117: 3667,
         126: 57416, 123: 57419, 124: 57421, 125: 57424,
-        76: 3612, 63: 3613, // keypad enter, fn → right ctrl sound
+        76: 3612, 63: 3613,
     ]
 }

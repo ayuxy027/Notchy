@@ -1,5 +1,4 @@
 #!/bin/sh
-# Builds Notchy.app, installs it to /Applications and starts it at login. Run: ./build.sh
 set -e
 cd "$(dirname "$0")"
 mkdir -p Notchy.app/Contents/MacOS
@@ -13,12 +12,10 @@ cat > Notchy.app/Contents/Info.plist <<EOF
   <key>CFBundleName</key><string>Notchy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
 </dict></plist>
 EOF
 rm -rf Notchy.app/Contents/Resources/Packs && mkdir -p Notchy.app/Contents/Resources && cp -R Packs Notchy.app/Contents/Resources/
-# Sign with a stable local certificate (in its own keychain) so macOS keeps the
-# Accessibility / Desktop permissions across rebuilds. Ad-hoc signing changes identity every build.
 KC="$HOME/Library/Keychains/notchy-signing.keychain-db"; KCPW=notchy; ID="Notchy Local Signing"
 if [ ! -f "$KC" ]; then
   T=$(mktemp -d)
@@ -28,7 +25,7 @@ if [ ! -f "$KC" ]; then
   openssl pkcs12 -export -legacy -inkey "$T/key.pem" -in "$T/cert.pem" -out "$T/id.p12" -passout pass:$KCPW 2>/dev/null \
     || openssl pkcs12 -export -inkey "$T/key.pem" -in "$T/cert.pem" -out "$T/id.p12" -passout pass:$KCPW
   security create-keychain -p $KCPW "$KC"
-  security set-keychain-settings "$KC"   # no auto-lock
+  security set-keychain-settings "$KC"
   security unlock-keychain -p $KCPW "$KC"
   security import "$T/id.p12" -k "$KC" -P $KCPW -T /usr/bin/codesign >/dev/null
   security set-key-partition-list -S apple-tool:,apple: -s -k $KCPW "$KC" >/dev/null
@@ -38,11 +35,9 @@ security unlock-keychain -p $KCPW "$KC"
 codesign --force --keychain "$KC" -s "$ID" -i com.ayux.notchy Notchy.app
 echo "Built $(pwd)/Notchy.app"
 
-# Install to /Applications so launchd never depends on where this repo lives.
 pkill -x Notchy || true
 rm -rf /Applications/Notchy.app && ditto Notchy.app /Applications/Notchy.app
 
-# Always running: start at login, restart if it crashes (Quit from the menu still quits — clean exit).
 AGENT="$HOME/Library/LaunchAgents/com.ayux.notchy.plist"
 cat > "$AGENT" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,5 +51,6 @@ cat > "$AGENT" <<PLIST
 </dict></plist>
 PLIST
 launchctl bootout gui/$(id -u)/com.ayux.notchy 2>/dev/null || true
+while launchctl print gui/$(id -u)/com.ayux.notchy >/dev/null 2>&1; do sleep 0.2; done
 launchctl bootstrap gui/$(id -u) "$AGENT"
 echo "Notchy (re)started via launchd"
