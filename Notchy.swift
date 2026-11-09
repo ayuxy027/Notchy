@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import IOKit.ps
 import IOKit.pwr_mgt
+import CryptoKit
 
 
 struct Metric { var value = "–", sub = " ", frac = 0.0 }
@@ -35,8 +36,37 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
     private var wasOnAC: Bool?
     private var lastNet: (at: Date, bytes: [String: (i: UInt32, o: UInt32)])?
     private var netPeak = 1_000_000.0
+    private var capacity = UserDefaults.standard.double(forKey: "netDown")
+    @Published var speedNote = UserDefaults.standard.string(forKey: "speedNote") ?? "Tap to test"
+
+    func testSpeed() {
+        guard speedNote != "Testing…" else { return }
+        speedNote = "Testing…"
+        Task.detached {
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/networkQuality")
+            p.arguments = ["-c", "-M", "15"]
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            try? p.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let dl = (j?["dl_throughput"] as? NSNumber)?.doubleValue, ul = (j?["ul_throughput"] as? NSNumber)?.doubleValue
+            await self.setSpeed(dl, ul)
+        }
+    }
+
+    private func setSpeed(_ dl: Double?, _ ul: Double?) {
+        guard let dl, let ul, dl > 0 else { speedNote = "Test failed"; return }
+        capacity = dl
+        speedNote = "\(Int(dl / 1e6))↓ \(Int(ul / 1e6))↑ Mbps"
+        UserDefaults.standard.set(dl, forKey: "netDown")
+        UserDefaults.standard.set(speedNote, forKey: "speedNote")
+    }
 
     init() {
+        pruneClips()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in MainActor.assumeIsolated { self.pollClipboard() } }
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in MainActor.assumeIsolated { self.refresh() } }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in MainActor.assumeIsolated { self.pollScreenshots() } }
@@ -111,19 +141,29 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
             addImage(raw)
             return
         }
-        guard !text.isEmpty, let str = pb.string(forType: .string) else { return }
+        guard !text.isEmpty, let str = pb.string(forType: .string), str.utf8.count <= 200_000 else { return }
         add(str)
     }
 
     private func addImage(_ raw: Data) {
         guard let png = raw.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? raw
                 : NSBitmapImageRep(data: raw)?.representation(using: .png, properties: [:]) else { return }
-        if let existing = clips.first(where: { Self.imageURL($0).map { (try? Data(contentsOf: $0)) == png } ?? false }) {
-            add(existing); return
-        }
-        let name = UUID().uuidString + ".png"
-        try? png.write(to: Self.imageDir.appendingPathComponent(name))
+        let name = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined() + ".png"
+        let url = Self.imageDir.appendingPathComponent(name)
+        if !FileManager.default.fileExists(atPath: url.path) { try? png.write(to: url) }
         add(Self.imgTag + name)
+    }
+
+    private func pruneClips() {
+        let fm = FileManager.default
+        clips = clips.filter { Self.imageURL($0).map { fm.fileExists(atPath: $0.path) } ?? true }
+        pinned.formIntersection(clips)
+        let used = Set(clips.compactMap { Self.imageURL($0)?.lastPathComponent })
+        for f in (try? fm.contentsOfDirectory(atPath: Self.imageDir.path)) ?? [] where !used.contains(f) {
+            try? fm.removeItem(at: Self.imageDir.appendingPathComponent(f))
+        }
+        UserDefaults.standard.set(clips, forKey: "clips")
+        UserDefaults.standard.set(Array(pinned), forKey: "pinnedClips")
     }
 
     private let shotDir: URL = {
@@ -224,11 +264,12 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
         let secs = max(Date().timeIntervalSince(last.at), 0.1)
         var i = 0.0, o = 0.0
         for (k, v) in now { if let l = last.bytes[k] { i += Double(v.i &- l.i); o += Double(v.o &- l.o) } }
-        i /= secs; o /= secs
+        i *= 8 / secs; o *= 8 / secs
         netPeak = max(netPeak, i, o)
-        let rate = { (b: Double) in ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .decimal) + "/s" }
-        down = Metric(value: rate(i), frac: i / netPeak)
-        up = Metric(value: rate(o), frac: o / netPeak)
+        let scale = max(capacity, netPeak)
+        let rate = { (b: Double) in b < 10e6 ? String(format: "%.1f Mbps", b / 1e6) : "\(Int(b / 1e6)) Mbps" }
+        down = Metric(value: rate(i), frac: i / scale)
+        up = Metric(value: rate(o), frac: o / scale)
     }
 
     func refresh() {
@@ -273,6 +314,7 @@ struct Metric { var value = "–", sub = " ", frac = 0.0 }
         let mins = d[kIOPSTimeToEmptyKey] as? Int ?? -1
 
         if wasOnAC == true && !onAC { UserDefaults.standard.set(Date(), forKey: "unplugged") }
+        if onAC { UserDefaults.standard.removeObject(forKey: "unplugged") }
         wasOnAC = onAC
         var sub = charging ? "Charging" : onAC ? "Plugged in" : mins > 0 ? "\(mins / 60)h \(mins % 60)m left" : "On battery"
         if !onAC, let t = UserDefaults.standard.object(forKey: "unplugged") as? Date {
@@ -330,7 +372,8 @@ struct NotchView: View {
                 VStack(spacing: 8) {
                 Grid(horizontalSpacing: 8, verticalSpacing: 8) {
                     GridRow { DualCard(icon: "cpu", title: "System", rows: [("CPU", m.cpu, Accent.cpu, 0.8), ("MEM", m.ram, Accent.memory, 0.85)])
-                              DualCard(icon: "arrow.up.arrow.down", title: "Network", rows: [("↓", m.down, Accent.disk, 2), ("↑", m.up, Accent.cpu, 2)]) }
+                              DualCard(icon: "arrow.up.arrow.down", title: "Network", note: m.speedNote, rows: [("↓", m.down, Accent.disk, 2), ("↑", m.up, Accent.cpu, 2)])
+                                  .onTapGesture { m.testSpeed() }.help("Tap to run a speed test") }
                     GridRow { StatCard(icon: batteryIcon, title: "Battery", m: m.battery, accent: Accent.power, warnBelow: 0.2).gridCellColumns(2) }
                 }
                 HStack(spacing: 8) {
@@ -445,6 +488,7 @@ func tinted(_ frac: Double, _ accent: [Color], warnAbove: Double = 2, warnBelow:
 
 struct DualCard: View {
     let icon: String, title: String
+    var note = ""
     let rows: [(label: String, m: Metric, accent: [Color], warnAbove: Double)]
 
     var body: some View {
@@ -453,6 +497,8 @@ struct DualCard: View {
                 Image(systemName: icon).font(.system(size: 9, weight: .bold))
                     .foregroundStyle(LinearGradient(colors: rows[0].accent, startPoint: .topLeading, endPoint: .bottomTrailing))
                 Text(title.uppercased()).foregroundStyle(dim)
+                Spacer(minLength: 4)
+                Text(note).foregroundStyle(dim).lineLimit(1).contentTransition(.numericText())
             }
             .font(.system(size: 9, weight: .semibold)).tracking(0.7)
             ForEach(rows.indices, id: \.self) { i in
@@ -471,6 +517,7 @@ struct DualCard: View {
         .padding(11)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .pane()
+        .contentShape(Rectangle())
         .animation(.spring(response: 0.6, dampingFraction: 0.85), value: rows.map(\.m.value))
     }
 }
